@@ -1,0 +1,6 @@
+yfinance
+ccxt
+pandas
+numpy
+mplfinance
+python-telegram-bot

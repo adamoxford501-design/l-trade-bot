@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: l-trade-core-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        value: 8511168805:AAFMV_AwHsgVVMBmvBTmfYYicRyJ5E7qcsU
