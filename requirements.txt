@@ -3,4 +3,6 @@ ccxt
 pandas
 numpy
 mplfinance
-python-telegram-bot
+python-telegram-bot==20.7
+uvicorn
+starlette
