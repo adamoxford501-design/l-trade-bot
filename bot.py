@@ -203,6 +203,7 @@ def generate_candlestick_chart(symbol, asset_type="crypto", period="7d", interva
     try:
         if asset_type == "crypto":
             exchange = ccxt.binance()
+            exchange.load_markets()
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -256,22 +257,40 @@ def calculate_atr(df, period=14):
 def generate_signal(symbol, asset_type="crypto", timeframe="1h"):
     try:
         if asset_type == "crypto":
-            exchange = ccxt.binance()
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+            exchange = ccxt.binance({
+                'enableRateLimit': True,
+                'timeout': 30000,
+            })
+            exchange.load_markets()
+            
+            symbol_formats = [symbol, f"{symbol}:USDT", symbol.replace('/', '')]
+            ohlcv = None
+            for sym in symbol_formats:
+                try:
+                    ohlcv = exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=200)
+                    if ohlcv and len(ohlcv) > 0:
+                        break
+                except:
+                    continue
+            
+            if not ohlcv or len(ohlcv) < 50:
+                return None
+                
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             current_price = df['Close'].iloc[-1]
         elif asset_type == "forex":
             forex_pair = symbol.replace("/", "") + "=X"
             ticker = yf.Ticker(forex_pair)
             df = ticker.history(period="7d", interval=timeframe)
+            if df.empty or len(df) < 50:
+                return None
             current_price = df['Close'].iloc[-1]
         else:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="7d", interval=timeframe)
+            if df.empty or len(df) < 50:
+                return None
             current_price = df['Close'].iloc[-1]
-        
-        if df.empty or len(df) < 50:
-            return None
         
         closes = df['Close']
         rsi = calculate_rsi(closes)
@@ -334,7 +353,7 @@ def generate_signal(symbol, asset_type="crypto", timeframe="1h"):
             'rsi': round(current_rsi, 1), 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
-        logging.error(f"Signal error: {e}")
+        logging.error(f"Signal error for {symbol}: {e}")
         return None
 
 # ---------- SIGNAL + CHART + CUSTOM AMOUNT BUY BUTTONS ----------
@@ -344,7 +363,7 @@ async def send_signal_with_chart(update: Update, context: ContextTypes.DEFAULT_T
     
     signal = generate_signal(symbol, asset_type, "1h")
     if not signal:
-        await update.message.reply_text(f"❌ *Could not fetch signal for {name}*", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ *Could not fetch signal for {name}*\n\nPlease try again later.", parse_mode='Markdown')
         return
     
     chart_path = generate_candlestick_chart(symbol, asset_type, "7d", "1h")
@@ -465,7 +484,7 @@ async def process_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 💰 *Remaining Balance:* ${wallet['balance'] - amount:.2f}
 
-⚠️ *Monitor your position! Use /positions to track P&L*
+⚠️ *Monitor your position! Use 📊 MY POSITIONS to track P&L*
 """
             await update.message.reply_text(confirm_msg, parse_mode='Markdown')
             await update.message.reply_text("🔙 *Back to Main Menu*", reply_markup=get_main_keyboard(), parse_mode='Markdown')
@@ -489,16 +508,19 @@ async def sell_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get current price
     try:
         if asset_type == "crypto":
-            exchange = ccxt.binance()
+            exchange = ccxt.binance({'enableRateLimit': True})
+            exchange.load_markets()
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
         elif asset_type == "forex":
             forex_pair = symbol.replace("/", "") + "=X"
             ticker = yf.Ticker(forex_pair)
-            current_price = ticker.history(period="1d", interval="1m")['Close'].iloc[-1]
+            df = ticker.history(period="1d", interval="5m")
+            current_price = df['Close'].iloc[-1] if not df.empty else entry_price
         else:
             ticker = yf.Ticker(symbol)
-            current_price = ticker.history(period="1d", interval="1m")['Close'].iloc[-1]
+            df = ticker.history(period="1d", interval="5m")
+            current_price = df['Close'].iloc[-1] if not df.empty else entry_price
     except:
         current_price = entry_price
     
@@ -508,7 +530,7 @@ async def sell_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     profit_percent = ((current_price - entry_price) / entry_price) * 100
-    profit_amount = (wallet['balance'] * 0.1) * (profit_percent / 100)
+    profit_amount = 100 * (profit_percent / 100)
     
     add_balance(user_id, profit_amount)
     
@@ -553,15 +575,16 @@ async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = pos['entry']
         amount = pos['amount']
         
-        # Get current price
         try:
             if 'USDT' in symbol:
-                exchange = ccxt.binance()
+                exchange = ccxt.binance({'enableRateLimit': True})
+                exchange.load_markets()
                 ticker = exchange.fetch_ticker(symbol)
                 current_price = ticker['last']
             else:
                 ticker = yf.Ticker(symbol)
-                current_price = ticker.history(period="1d", interval="5m")['Close'].iloc[-1]
+                df = ticker.history(period="1d", interval="5m")
+                current_price = df['Close'].iloc[-1] if not df.empty else entry
         except:
             current_price = entry
         
@@ -1035,7 +1058,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
-    # Check for pending custom buy amount
     if context.user_data.get('pending_custom_buy'):
         await process_custom_buy(update, context)
         return
@@ -1052,12 +1074,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_withdraw(update, context)
         return
     
-    # Wallet type selection
     if text in ["💎 TON", "🪙 TRC20 (USDT)", "🔷 BEP20 (USDT)", "💠 ERC20 (USDT)", "₿ BITCOIN", "◎ SOLANA"]:
         await handle_wallet_type(update, context)
         return
     
-    # Deposit amount selection
     if text in ["💰 $10", "💰 $25", "💰 $50", "💰 $100", "💰 $250", "💰 $500", "💰 $1000", "💰 CUSTOM"]:
         await handle_deposit_amount(update, context)
         return
@@ -1094,52 +1114,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━━
 
 1️⃣ *Connect Wallet* → 👛 MY WALLET
-   • Select your blockchain (TON/TRC20/BEP20/ERC20/BTC/SOL)
-   • Send your wallet address
-
 2️⃣ *Deposit Funds* → 💰 DEPOSIT
-   • Select amount ($10 - $10000)
-   • Send USDT to provided address
-   • Click "I HAVE SENT"
-   • Wait for admin approval
-
 3️⃣ *Get Signals* → 🪙 CRYPTO/FOREX/STOCKS
-   • Choose your asset
-   • View chart + signal
-   • Click BUY (Custom Amount)
-   • Enter your trade amount
-
-4️⃣ *Track Positions* → 📊 MY POSITIONS
-   • View open trades
-   • Check real-time P&L
-
-5️⃣ *Withdraw Profits* → 💸 WITHDRAW
-   • Enter amount
-   • Wait for admin approval
+4️⃣ *Click BUY* → Enter amount
+5️⃣ *Track Positions* → 📊 MY POSITIONS
+6️⃣ *Withdraw Profits* → 💸 WITHDRAW
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ *CONFIDENCE LEVELS*
 ━━━━━━━━━━━━━━━━━━━━━
 
-🔥 *HIGH* - Strong signal (70%+)
-⚡ *MEDIUM* - Good signal (60%)
-💤 *LOW* - Weak signal (50%)
-
-━━━━━━━━━━━━━━━━━━━━━
-💡 *PRO TIPS*
-━━━━━━━━━━━━━━━━━━━━━
-
-• Always use STOP LOSS
-• Never risk more than 2% per trade
-• Take 50% profit at TP1
-• Check MY POSITIONS for live P&L
+🔥 HIGH - Strong signal (70%+)
+⚡ MEDIUM - Good signal (60%)
+💤 LOW - Weak signal (50%)
 
 ━━━━━━━━━━━━━━━━━━━━━
 📞 *Contact:* @LawlietTobi
 """
         await update.message.reply_text(help_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     elif text == "📞 CONTACT DEVELOPER":
-        await update.message.reply_text("📞 *CONTACT DEVELOPER* 📞\n\n━━━━━━━━━━━━━━━━━━━━━\n👤 *Telegram:* @LawlietTobi\n━━━━━━━━━━━━━━━━━━━━━\n\n💬 *Reach out for:* Bot Customization | New Features | Bug Reports | Trading Strategies\n\n🚀 *Happy Trading!*", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("📞 *CONTACT DEVELOPER* 📞\n\n👤 *Telegram:* @LawlietTobi", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     elif text == "🔙 BACK TO MAIN MENU":
         await show_main_menu(update, context)
     elif text in ["₿ BTC/USDT", "⟠ ETH/USDT", "◎ SOL/USDT", "🐕 DOGE/USDT", "💱 XRP/USDT", "⬆️ ADA/USDT", "🏔️ AVAX/USDT", "🟣 MATIC/USDT"]:
