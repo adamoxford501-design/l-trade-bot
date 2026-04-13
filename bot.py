@@ -12,6 +12,7 @@ from datetime import datetime
 import asyncio
 import logging
 from collections import deque
+import secrets
 
 # ---------- CONFIG ----------
 TELEGRAM_TOKEN = "8511168805:AAFMV_AwHsgVVMBmvBTmfYYicRyJ5E7qcsU"
@@ -20,7 +21,16 @@ WELCOME_VIDEO_URL = "https://files.catbox.moe/ykynt9.mp4"
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 
-# Deposit Addresses
+# New User Bonus
+NEW_USER_BONUS = 25
+
+# Referral Bonus (per referred user)
+REFERRAL_BONUS = 0.5
+
+# Minimum Withdrawal
+MIN_WITHDRAWAL = 10
+
+# Deposit Addresses (where user sends money)
 DEPOSIT_ADDRESSES = {
     "TRC20 (USDT)": "TLC8bebj9L57ZsihNiY32d4nWH8CVDvLpu",
     "BEP20 (USDT)": "0xc09B4D0a9b0EDfbE30753F5b79360a4F82e570a1",
@@ -33,6 +43,8 @@ DEPOSIT_ADDRESSES = {
 # File paths for persistence
 WALLETS_FILE = "user_wallets.json"
 POSITIONS_FILE = "user_positions.json"
+BONUS_CLAIMED_FILE = "bonus_claimed.json"
+REFERRALS_FILE = "referrals.json"
 
 def load_wallets():
     if os.path.exists(WALLETS_FILE):
@@ -70,28 +82,83 @@ def save_positions():
     except:
         pass
 
+def load_bonus_claimed():
+    if os.path.exists(BONUS_CLAIMED_FILE):
+        try:
+            with open(BONUS_CLAIMED_FILE, 'r') as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except:
+            return {}
+    return {}
+
+def save_bonus_claimed():
+    try:
+        with open(BONUS_CLAIMED_FILE, 'w') as f:
+            to_save = {str(k): v for k, v in bonus_claimed.items()}
+            json.dump(to_save, f, indent=4, default=str)
+    except:
+        pass
+
+def load_referrals():
+    if os.path.exists(REFERRALS_FILE):
+        try:
+            with open(REFERRALS_FILE, 'r') as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except:
+            return {}
+    return {}
+
+def save_referrals():
+    try:
+        with open(REFERRALS_FILE, 'w') as f:
+            to_save = {str(k): v for k, v in referrals.items()}
+            json.dump(to_save, f, indent=4, default=str)
+    except:
+        pass
+
 # ---------- STORAGE ----------
 user_wallets = load_wallets()
 user_positions = load_positions()
+bonus_claimed = load_bonus_claimed()
+referrals = load_referrals()
 user_trades = {}
 pending_deposits = {}
 pending_withdrawals = {}
 request_counter = 0
 
 def save_wallet(user_id, address, wallet_type):
-    user_wallets[user_id] = {
-        'address': address, 
-        'balance': 0, 
-        'deposits': [], 
-        'withdrawals': [], 
-        'wallet_type': wallet_type, 
+    """Save or update wallet for user (supports multiple wallets per user)"""
+    if user_id not in user_wallets:
+        user_wallets[user_id] = {
+            'wallets': {},
+            'balance': 0,
+            'deposits': [],
+            'withdrawals': [],
+            'connected_on': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    
+    user_wallets[user_id]['wallets'][wallet_type] = {
+        'address': address,
         'connected_on': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     save_wallets()
     return True
 
-def get_wallet(user_id):
-    return user_wallets.get(user_id, None)
+def get_wallet(user_id, wallet_type=None):
+    """Get wallet address for specific type or all wallets"""
+    if user_id not in user_wallets:
+        return None
+    if wallet_type:
+        return user_wallets[user_id]['wallets'].get(wallet_type)
+    return user_wallets.get(user_id)
+
+def get_all_wallets(user_id):
+    """Get all wallets of a user"""
+    if user_id not in user_wallets:
+        return {}
+    return user_wallets[user_id].get('wallets', {})
 
 def add_balance(user_id, amount):
     if user_id in user_wallets:
@@ -140,6 +207,62 @@ def get_recent_trades(user_id):
         return None
     return list(user_trades[user_id])
 
+def has_claimed_bonus(user_id):
+    return bonus_claimed.get(user_id, False)
+
+def claim_bonus(user_id):
+    if has_claimed_bonus(user_id):
+        return False
+    bonus_claimed[user_id] = True
+    save_bonus_claimed()
+    return True
+
+# ---------- REFERRAL FUNCTIONS ----------
+def generate_referral_code(user_id):
+    return f"LT{user_id}{secrets.token_hex(4)[:6].upper()}"
+
+def get_referral_code(user_id):
+    if user_id not in referrals:
+        code = generate_referral_code(user_id)
+        referrals[user_id] = {
+            'code': code,
+            'referred_users': [],
+            'earned': 0,
+            'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        save_referrals()
+        return code
+    return referrals[user_id]['code']
+
+def get_referral_stats(user_id):
+    if user_id not in referrals:
+        return {'code': None, 'count': 0, 'earned': 0}
+    return {
+        'code': referrals[user_id]['code'],
+        'count': len(referrals[user_id]['referred_users']),
+        'earned': referrals[user_id]['earned']
+    }
+
+def add_referral(referrer_id, referred_id):
+    if referrer_id not in referrals:
+        get_referral_code(referrer_id)
+    
+    # Check if already referred by someone
+    for uid, data in referrals.items():
+        if referred_id in data['referred_users']:
+            return False
+    
+    # Add referral
+    if referrer_id != referred_id:
+        referrals[referrer_id]['referred_users'].append(referred_id)
+        referrals[referrer_id]['earned'] += REFERRAL_BONUS
+        save_referrals()
+        
+        # Add bonus to referrer
+        add_balance(referrer_id, REFERRAL_BONUS)
+        return True
+    return False
+
 # ---------- KEYBOARD LAYOUTS ----------
 def get_main_keyboard():
     keyboard = [
@@ -147,11 +270,21 @@ def get_main_keyboard():
         ["📈 STOCK SIGNALS", "🌍 ALL MARKETS"],
         ["👛 MY WALLET", "📊 MY POSITIONS"],
         ["💰 DEPOSIT", "💸 WITHDRAW"],
+        ["🎁 CLAIM BONUS", "👥 REFER & EARN"],
         ["❓ HELP & SUPPORT", "📞 CONTACT DEVELOPER"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_wallet_type_keyboard():
+    keyboard = [
+        ["💎 TON", "🪙 TRC20 (USDT)"],
+        ["🔷 BEP20 (USDT)", "💠 ERC20 (USDT)"],
+        ["₿ BITCOIN", "◎ SOLANA"],
+        ["🔙 BACK TO MAIN MENU"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_withdraw_token_keyboard():
     keyboard = [
         ["💎 TON", "🪙 TRC20 (USDT)"],
         ["🔷 BEP20 (USDT)", "💠 ERC20 (USDT)"],
@@ -609,11 +742,23 @@ async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- WALLET HANDLERS ----------
 async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👛 *CONNECT YOUR WALLET* 👛\n\n━━━━━━━━━━━━━━━━━━━━━\nSelect your wallet type below:\n\n💎 TON Network\n🪙 TRC20 (USDT)\n🔷 BEP20 (USDT)\n💠 ERC20 (USDT)\n₿ BITCOIN\n◎ SOLANA\n━━━━━━━━━━━━━━━━━━━━━\n👇 *Click a button below:*",
-        reply_markup=get_wallet_type_keyboard(),
-        parse_mode='Markdown'
-    )
+    user_id = update.effective_user.id
+    existing_wallets = get_all_wallets(user_id)
+    
+    if existing_wallets:
+        msg = "👛 *MY CONNECTED WALLETS* 👛\n\n━━━━━━━━━━━━━━━━━━━━━\n"
+        for w_type, w_data in existing_wallets.items():
+            msg += f"🔗 *{w_type}:*\n"
+            msg += f"   📤 `{w_data['address'][:12]}...{w_data['address'][-8:]}`\n"
+            msg += f"   📅 {w_data['connected_on']}\n\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "👇 *Select option:*\n"
+        msg += "• Add New Wallet - Select type below\n"
+        msg += "• BACK TO MAIN MENU\n\n"
+    else:
+        msg = "👛 *CONNECT YOUR WALLET* 👛\n\n━━━━━━━━━━━━━━━━━━━━━\nSelect your wallet type below:\n━━━━━━━━━━━━━━━━━━━━━"
+    
+    await update.message.reply_text(msg, reply_markup=get_wallet_type_keyboard(), parse_mode='Markdown')
 
 async def handle_wallet_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -630,7 +775,7 @@ async def handle_wallet_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if text in wallet_type_map:
         context.user_data['wallet_type'] = wallet_type_map[text]
         await update.message.reply_text(
-            f"✅ *Selected:* {text}\n\n━━━━━━━━━━━━━━━━━━━━━\nSend your wallet address:\n\n📤 *Example:*\n• TON: `EQDxxxxxxxxxxxxxxxx...`\n• TRC20: `TXYZabcd1234567890...`\n• BEP20/ERC20: `0x742d35Cc6634C053...`\n• BITCOIN: `bc1qar0srrr7xfkvy5...`\n• SOLANA: `7EcxRkCxnB5xTS5E6q...`\n━━━━━━━━━━━━━━━━━━━━━\n\nType your address now:",
+            f"✅ *Selected:* {text}\n\n━━━━━━━━━━━━━━━━━━━━━\nSend your wallet address for {text}:\n\n📤 *Example:*\n• TON: `EQDxxxxxxxxxxxxxxxx...`\n• TRC20: `TXYZabcd1234567890...`\n• BEP20/ERC20: `0x742d35Cc6634C053...`\n• BITCOIN: `bc1qar0srrr7xfkvy5...`\n• SOLANA: `7EcxRkCxnB5xTS5E6q...`\n━━━━━━━━━━━━━━━━━━━━━\n\nType your address now:",
             parse_mode='Markdown'
         )
         context.user_data['awaiting_wallet_address'] = True
@@ -649,8 +794,27 @@ async def handle_wallet_address(update: Update, context: ContextTypes.DEFAULT_TY
     
     if len(address) >= 25:
         save_wallet(user_id, address, wallet_type)
+        
+        # Check for referral (if user came via referral link)
+        referrer_id = context.user_data.get('referrer_id')
+        if referrer_id and referrer_id != user_id:
+            if add_referral(referrer_id, user_id):
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"🎉 *REFERRAL BONUS!* 🎉\n\n━━━━━━━━━━━━━━━━━━━━━\n👤 *New User:* @{update.effective_user.username or 'New User'}\n💰 *Bonus Earned:* +${REFERRAL_BONUS} USDT\n💵 *New Balance:* ${get_wallet(referrer_id)['balance']:.2f}\n━━━━━━━━━━━━━━━━━━━━━\n\nKeep sharing your referral link to earn more!",
+                    parse_mode='Markdown'
+                )
+        
+        # Check if user is new and give bonus (only once overall)
+        if not has_claimed_bonus(user_id):
+            claim_bonus(user_id)
+            add_balance(user_id, NEW_USER_BONUS)
+            bonus_msg = f"\n\n🎁 *NEW USER BONUS!* 🎁\n💰 +${NEW_USER_BONUS} USDT added to your wallet!"
+        else:
+            bonus_msg = ""
+        
         await update.message.reply_text(
-            f"✅ *Wallet Connected Successfully!* ✅\n\n━━━━━━━━━━━━━━━━━━━━━\n🔗 *Type:* {wallet_type}\n📤 *Address:* `{address[:12]}...{address[-8:]}`\n💰 *Balance:* $0\n📅 *Connected:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n━━━━━━━━━━━━━━━━━━━━━\n\n🎉 Your wallet is now linked to L TRADE CORE!\n\nUse 💰 DEPOSIT to add funds.",
+            f"✅ *Wallet Connected Successfully!* ✅\n\n━━━━━━━━━━━━━━━━━━━━━\n🔗 *Type:* {wallet_type}\n📤 *Address:* `{address[:12]}...{address[-8:]}`\n💰 *Balance:* ${user_wallets[user_id]['balance']:.2f}\n📅 *Connected:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n━━━━━━━━━━━━━━━━━━━━━\n\n🎉 Your wallet is now linked to L TRADE CORE!{bonus_msg}\n\nUse 💰 DEPOSIT to add funds.\nUse 👥 REFER & EARN to invite friends!",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
@@ -659,10 +823,12 @@ async def handle_wallet_address(update: Update, context: ContextTypes.DEFAULT_TY
     
     context.user_data['awaiting_wallet_address'] = False
     context.user_data['wallet_type'] = None
+    context.user_data['referrer_id'] = None
 
 async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallet = get_wallet(user_id)
+    wallets = get_all_wallets(user_id)
     
     if not wallet:
         await update.message.reply_text(
@@ -675,17 +841,102 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"""
 👛 *MY WALLET* 👛
 ━━━━━━━━━━━━━━━━━━━━━
-🔗 *Type:* {wallet['wallet_type']}
-📤 *Address:* `{wallet['address'][:12]}...{wallet['address'][-8:]}`
 💰 *Balance:* `${wallet['balance']:.2f}`
 📅 *Connected:* {wallet['connected_on']}
 ━━━━━━━━━━━━━━━━━━━━━
 📊 *Total Deposits:* ${sum(d['amount'] for d in wallet['deposits']):.2f}
 📊 *Total Withdrawals:* ${sum(w['amount'] for w in wallet['withdrawals']):.2f}
 ━━━━━━━━━━━━━━━━━━━━━
-💡 *Actions:* Use 💰 DEPOSIT or 💸 WITHDRAW
-"""
+🔗 *Connected Wallets:*\n"""
+    
+    for w_type, w_data in wallets.items():
+        msg += f"• {w_type}: `{w_data['address'][:12]}...{w_data['address'][-8:]}`\n"
+    
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━\n💡 *Actions:* Use 💰 DEPOSIT or 💸 WITHDRAW"
+    
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+
+# ---------- BONUS HANDLER ----------
+async def claim_bonus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    wallet = get_wallet(user_id)
+    
+    if not wallet:
+        await update.message.reply_text(
+            "❌ *No wallet connected!*\n\n━━━━━━━━━━━━━━━━━━━━━\nPlease connect your wallet first using 👛 MY WALLET.\n━━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+    
+    if has_claimed_bonus(user_id):
+        await update.message.reply_text(
+            "⚠️ *Bonus Already Claimed!* ⚠️\n\n━━━━━━━━━━━━━━━━━━━━━\nYou have already claimed your new user bonus.\nBonus can only be claimed once per user.\n━━━━━━━━━━━━━━━━━━━━━\n\n💡 *Want more bonus?*\n• Refer friends to L TRADE CORE\n• Complete more trades\n• Participate in events",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Claim bonus
+    claim_bonus(user_id)
+    add_balance(user_id, NEW_USER_BONUS)
+    
+    await update.message.reply_text(
+        f"🎉 *BONUS CLAIMED SUCCESSFULLY!* 🎉\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Amount:* +${NEW_USER_BONUS} USDT\n💵 *New Balance:* ${get_wallet(user_id)['balance']:.2f}\n━━━━━━━━━━━━━━━━━━━━━\n\n✨ *Start trading now!*\nUse 🪙 CRYPTO SIGNALS to get started.\n\n⚠️ *Risk Warning:* Trade responsibly!",
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
+    )
+
+# ---------- REFERRAL HANDLER ----------
+async def referral_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    wallet = get_wallet(user_id)
+    
+    if not wallet:
+        await update.message.reply_text(
+            "❌ *No wallet connected!*\n\n━━━━━━━━━━━━━━━━━━━━━\nPlease connect your wallet first using 👛 MY WALLET.\n━━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+    
+    code = get_referral_code(user_id)
+    bot_username = (await context.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start=ref_{code}"
+    
+    stats = get_referral_stats(user_id)
+    
+    msg = f"""
+👥 *REFER & EARN* 👥
+
+━━━━━━━━━━━━━━━━━━━━━
+💰 *Bonus per Referral:* +${REFERRAL_BONUS} USDT
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 *Your Stats:*
+• 👤 Referrals: {stats['count']}
+• 💰 Total Earned: ${stats['earned']:.2f}
+
+━━━━━━━━━━━━━━━━━━━━━
+🔗 *Your Referral Link:*
+`{referral_link}`
+
+━━━━━━━━━━━━━━━━━━━━━
+📤 *Share this link with friends!*
+
+When they join and connect wallet, you get ${REFERRAL_BONUS} instantly!
+
+━━━━━━━━━━━━━━━━━━━━━
+💡 *Pro Tip:* Share on social media for more referrals!
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 SHARE LINK", url=f"https://t.me/share/url?url={referral_link}&text=Join%20L%20TRADE%20CORE%20and%20get%20${NEW_USER_BONUS}%20bonus!%20Use%20my%20link%20to%20join%20👇")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
 
 # ---------- DEPOSIT HANDLERS ----------
 async def deposit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -717,16 +968,14 @@ async def handle_deposit_amount(update: Update, context: ContextTypes.DEFAULT_TY
     if text in amount_map:
         amount = amount_map[text]
         context.user_data['deposit_amount'] = amount
-        deposit_addr = DEPOSIT_ADDRESSES.get(wallet['wallet_type'], "Address not found")
         
+        # Show token selection for deposit
         await update.message.reply_text(
-            f"💰 *DEPOSIT ${amount} USDT* 💰\n\n━━━━━━━━━━━━━━━━━━━━━\n💵 *Amount:* ${amount} USDT\n🔗 *Network:* {wallet['wallet_type']}\n📤 *Send to Address:*\n`{deposit_addr}`\n━━━━━━━━━━━━━━━━━━━━━\n⚠️ *IMPORTANT:*\n• Send exactly ${amount} USDT\n• Use ONLY {wallet['wallet_type']} network\n• Minimum deposit: $10 USDT\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ After sending, click the button below:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ I HAVE SENT", callback_data=f"deposit_request_{amount}")],
-                [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
-            ]),
+            f"💰 *DEPOSIT ${amount} USDT* 💰\n\n━━━━━━━━━━━━━━━━━━━━━\n💵 *Amount:* ${amount} USDT\n━━━━━━━━━━━━━━━━━━━━━\n\n👇 *Select network to deposit:*",
+            reply_markup=get_wallet_type_keyboard(),
             parse_mode='Markdown'
         )
+        context.user_data['awaiting_deposit_network'] = True
     elif text == "💰 CUSTOM":
         await update.message.reply_text("💰 *CUSTOM AMOUNT* 💰\n\nEnter the amount you want to deposit (min $10, max $10000):\n\nExample: `100`", parse_mode='Markdown')
         context.user_data['awaiting_custom_deposit'] = True
@@ -734,6 +983,41 @@ async def handle_deposit_amount(update: Update, context: ContextTypes.DEFAULT_TY
         await show_main_menu(update, context)
     else:
         await update.message.reply_text("❌ Please select an amount from the buttons!", reply_markup=get_deposit_amount_keyboard(), parse_mode='Markdown')
+
+async def handle_deposit_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_deposit_network'):
+        return
+    
+    text = update.message.text
+    
+    wallet_type_map = {
+        "💎 TON": "TON",
+        "🪙 TRC20 (USDT)": "TRC20",
+        "🔷 BEP20 (USDT)": "BEP20",
+        "💠 ERC20 (USDT)": "ERC20",
+        "₿ BITCOIN": "BITCOIN",
+        "◎ SOLANA": "SOLANA"
+    }
+    
+    if text in wallet_type_map:
+        network = wallet_type_map[text]
+        deposit_addr = DEPOSIT_ADDRESSES.get(network, "Address not found")
+        amount = context.user_data.get('deposit_amount', 0)
+        
+        await update.message.reply_text(
+            f"💰 *DEPOSIT INSTRUCTION* 💰\n\n━━━━━━━━━━━━━━━━━━━━━\n💵 *Amount:* ${amount} USDT\n🔗 *Network:* {network}\n📤 *Send to Address:*\n`{deposit_addr}`\n━━━━━━━━━━━━━━━━━━━━━\n⚠️ *IMPORTANT:*\n• Send exactly ${amount} USDT\n• Use ONLY {network} network\n• Minimum deposit: $10 USDT\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ After sending, click the button below:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I HAVE SENT", callback_data=f"deposit_request_{amount}")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
+            ]),
+            parse_mode='Markdown'
+        )
+        context.user_data['awaiting_deposit_network'] = False
+    elif text == "🔙 BACK TO MAIN MENU":
+        await show_main_menu(update, context)
+        context.user_data['awaiting_deposit_network'] = False
+    else:
+        await update.message.reply_text("❌ Please select a network from the buttons!", reply_markup=get_wallet_type_keyboard(), parse_mode='Markdown')
 
 async def handle_custom_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('awaiting_custom_deposit'):
@@ -744,19 +1028,13 @@ async def handle_custom_deposit(update: Update, context: ContextTypes.DEFAULT_TY
         if amount < 10 or amount > 10000:
             await update.message.reply_text("❌ Amount must be between $10 and $10000!", parse_mode='Markdown')
         else:
-            user_id = update.effective_user.id
-            wallet = get_wallet(user_id)
-            deposit_addr = DEPOSIT_ADDRESSES.get(wallet['wallet_type'], "Address not found")
             context.user_data['deposit_amount'] = amount
-            
             await update.message.reply_text(
-                f"💰 *DEPOSIT ${amount} USDT* 💰\n\n━━━━━━━━━━━━━━━━━━━━━\n💵 *Amount:* ${amount} USDT\n🔗 *Network:* {wallet['wallet_type']}\n📤 *Send to Address:*\n`{deposit_addr}`\n━━━━━━━━━━━━━━━━━━━━━\n⚠️ *Use ONLY {wallet['wallet_type']} network!*\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ After sending, click the button below:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ I HAVE SENT", callback_data=f"deposit_request_{amount}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
-                ]),
+                f"💰 *DEPOSIT ${amount} USDT* 💰\n\n━━━━━━━━━━━━━━━━━━━━━\n💵 *Amount:* ${amount} USDT\n━━━━━━━━━━━━━━━━━━━━━\n\n👇 *Select network to deposit:*",
+                reply_markup=get_wallet_type_keyboard(),
                 parse_mode='Markdown'
             )
+            context.user_data['awaiting_deposit_network'] = True
     except ValueError:
         await update.message.reply_text("❌ Please enter a valid number!", parse_mode='Markdown')
     
@@ -776,13 +1054,13 @@ async def deposit_request_callback(update: Update, context: ContextTypes.DEFAULT
     request_id = request_counter
     
     pending_deposits[request_id] = {
-        'user_id': user_id, 'amount': amount, 'wallet_type': wallet['wallet_type'],
-        'address': wallet['address'], 'status': 'pending',
+        'user_id': user_id, 'amount': amount, 'wallet_type': 'Deposit',
+        'address': 'N/A', 'status': 'pending',
         'username': user.username or user.first_name, 'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
     await query.edit_message_text(
-        f"⏳ *DEPOSIT REQUEST #{request_id} SUBMITTED!* ⏳\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Amount:* ${amount} USDT\n🔗 *Network:* {wallet['wallet_type']}\n🕐 *Status:* PENDING REVIEW\n━━━━━━━━━━━━━━━━━━━━━\n\n⏱️ Please wait. Admin will review your deposit.\n\n📞 Contact @LawlietTobi if any issue.",
+        f"⏳ *DEPOSIT REQUEST #{request_id} SUBMITTED!* ⏳\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Amount:* ${amount} USDT\n🕐 *Status:* PENDING REVIEW\n━━━━━━━━━━━━━━━━━━━━━\n\n⏱️ Please wait. Admin will review your deposit.\n\n📞 Contact @LawlietTobi if any issue.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]),
         parse_mode='Markdown'
     )
@@ -794,8 +1072,6 @@ async def deposit_request_callback(update: Update, context: ContextTypes.DEFAULT
 👤 *User:* @{user.username or user.first_name}
 🆔 *User ID:* `{user_id}`
 💰 *Amount:* ${amount} USDT
-🔗 *Network:* {wallet['wallet_type']}
-📤 *Address:* `{wallet['address'][:12]}...{wallet['address'][-8:]}`
 📅 *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ━━━━━━━━━━━━━━━━━━━━━
 """
@@ -812,19 +1088,65 @@ async def withdraw_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Connect wallet first using 👛 MY WALLET", reply_markup=get_main_keyboard(), parse_mode='Markdown')
         return
     
-    if wallet['balance'] < 10:
-        await update.message.reply_text(f"❌ Minimum withdrawal is $10 USDT. Your balance: ${wallet['balance']:.2f}", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    if wallet['balance'] < MIN_WITHDRAWAL:
+        await update.message.reply_text(f"❌ Minimum withdrawal is ${MIN_WITHDRAWAL} USDT. Your balance: ${wallet['balance']:.2f}", reply_markup=get_main_keyboard(), parse_mode='Markdown')
         return
     
     await update.message.reply_text(
-        f"💸 *WITHDRAW FUNDS* 💸\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Available Balance:* ${wallet['balance']:.2f}\n🔗 *Network:* {wallet['wallet_type']}\n📤 *To Address:* `{wallet['address'][:12]}...{wallet['address'][-8:]}`\n━━━━━━━━━━━━━━━━━━━━━\n\nEnter the amount you want to withdraw (min $10):",
+        f"💸 *WITHDRAW FUNDS* 💸\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Available Balance:* ${wallet['balance']:.2f}\n━━━━━━━━━━━━━━━━━━━━━\n\n👇 *Select network to withdraw:*",
+        reply_markup=get_withdraw_token_keyboard(),
         parse_mode='Markdown'
     )
-    context.user_data['awaiting_withdraw'] = True
+    context.user_data['awaiting_withdraw_network'] = True
 
-async def handle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global request_counter
-    if not context.user_data.get('awaiting_withdraw'):
+async def handle_withdraw_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_withdraw_network'):
+        return
+    
+    text = update.message.text
+    
+    wallet_type_map = {
+        "💎 TON": "TON",
+        "🪙 TRC20 (USDT)": "TRC20",
+        "🔷 BEP20 (USDT)": "BEP20",
+        "💠 ERC20 (USDT)": "ERC20",
+        "₿ BITCOIN": "BITCOIN",
+        "◎ SOLANA": "SOLANA"
+    }
+    
+    if text in wallet_type_map:
+        network = wallet_type_map[text]
+        user_id = update.effective_user.id
+        wallet = get_wallet(user_id)
+        
+        # Check if user has this wallet connected
+        user_wallets_dict = get_all_wallets(user_id)
+        if network not in user_wallets_dict:
+            await update.message.reply_text(
+                f"❌ *{network} wallet not connected!*\n\n━━━━━━━━━━━━━━━━━━━━━\nPlease connect your {network} wallet first using 👛 MY WALLET.\n━━━━━━━━━━━━━━━━━━━━━",
+                reply_markup=get_main_keyboard(),
+                parse_mode='Markdown'
+            )
+            context.user_data['awaiting_withdraw_network'] = False
+            return
+        
+        context.user_data['withdraw_network'] = network
+        context.user_data['withdraw_address'] = user_wallets_dict[network]['address']
+        
+        await update.message.reply_text(
+            f"💸 *WITHDRAW FUNDS* 💸\n\n━━━━━━━━━━━━━━━━━━━━━\n🔗 *Network:* {network}\n📤 *Your Address:* `{user_wallets_dict[network]['address'][:12]}...{user_wallets_dict[network]['address'][-8:]}`\n💰 *Available Balance:* ${wallet['balance']:.2f}\n━━━━━━━━━━━━━━━━━━━━━\n\nEnter the amount you want to withdraw (min ${MIN_WITHDRAWAL}, max ${wallet['balance']:.2f}):",
+            parse_mode='Markdown'
+        )
+        context.user_data['awaiting_withdraw_amount'] = True
+        context.user_data['awaiting_withdraw_network'] = False
+    elif text == "🔙 BACK TO MAIN MENU":
+        await show_main_menu(update, context)
+        context.user_data['awaiting_withdraw_network'] = False
+    else:
+        await update.message.reply_text("❌ Please select a network from the buttons!", reply_markup=get_withdraw_token_keyboard(), parse_mode='Markdown')
+
+async def handle_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_withdraw_amount'):
         return
     
     try:
@@ -832,23 +1154,26 @@ async def handle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         user = update.effective_user
         wallet = get_wallet(user_id)
+        network = context.user_data.get('withdraw_network')
+        withdraw_address = context.user_data.get('withdraw_address')
         
-        if amount < 10:
-            await update.message.reply_text("❌ Minimum withdrawal is $10 USDT!", parse_mode='Markdown')
+        if amount < MIN_WITHDRAWAL:
+            await update.message.reply_text(f"❌ Minimum withdrawal is ${MIN_WITHDRAWAL} USDT!", parse_mode='Markdown')
         elif amount > wallet['balance']:
             await update.message.reply_text(f"❌ Insufficient balance! Your balance: ${wallet['balance']:.2f}", parse_mode='Markdown')
         else:
+            global request_counter
             request_counter += 1
             request_id = request_counter
             
             pending_withdrawals[request_id] = {
-                'user_id': user_id, 'amount': amount, 'wallet_type': wallet['wallet_type'],
-                'address': wallet['address'], 'status': 'pending',
+                'user_id': user_id, 'amount': amount, 'wallet_type': network,
+                'address': withdraw_address, 'status': 'pending',
                 'username': user.username or user.first_name, 'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
             await update.message.reply_text(
-                f"⏳ *WITHDRAWAL REQUEST #{request_id} SUBMITTED!* ⏳\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Amount:* ${amount} USDT\n🔗 *Network:* {wallet['wallet_type']}\n📤 *To:* `{wallet['address'][:12]}...{wallet['address'][-8:]}`\n🕐 *Status:* PENDING REVIEW\n━━━━━━━━━━━━━━━━━━━━━\n\n⏱️ Admin will review your withdrawal request.\n\n📞 Contact @LawlietTobi if any issue.",
+                f"⏳ *WITHDRAWAL REQUEST #{request_id} SUBMITTED!* ⏳\n\n━━━━━━━━━━━━━━━━━━━━━\n💰 *Amount:* ${amount} USDT\n🔗 *Network:* {network}\n📤 *To:* `{withdraw_address[:12]}...{withdraw_address[-8:]}`\n🕐 *Status:* PENDING REVIEW\n━━━━━━━━━━━━━━━━━━━━━\n\n⏱️ Admin will review your withdrawal request.\n\n📞 Contact @LawlietTobi if any issue.",
                 reply_markup=get_main_keyboard(),
                 parse_mode='Markdown'
             )
@@ -860,8 +1185,8 @@ async def handle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👤 *User:* @{user.username or user.first_name}
 🆔 *User ID:* `{user_id}`
 💰 *Amount:* ${amount} USDT
-🔗 *Network:* {wallet['wallet_type']}
-📤 *To:* `{wallet['address'][:12]}...{wallet['address'][-8:]}`
+🔗 *Network:* {network}
+📤 *To:* `{withdraw_address}`
 📅 *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ━━━━━━━━━━━━━━━━━━━━━
 """
@@ -874,7 +1199,9 @@ async def handle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Please enter a valid number!", parse_mode='Markdown')
     
-    context.user_data['awaiting_withdraw'] = False
+    context.user_data['awaiting_withdraw_amount'] = False
+    context.user_data['withdraw_network'] = None
+    context.user_data['withdraw_address'] = None
 
 # ---------- ADMIN CALLBACKS ----------
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -999,6 +1326,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- WELCOME MESSAGE ----------
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Check for referral in start command
+    if context.args and len(context.args) > 0:
+        ref_code = context.args[0]
+        if ref_code.startswith('ref_'):
+            code = ref_code[4:]
+            for uid, data in referrals.items():
+                if data['code'] == code:
+                    context.user_data['referrer_id'] = uid
+                    break
+    
     welcome_caption = """
 ✨ *WELCOME TO L TRADE CORE* ✨
 
@@ -1014,6 +1351,8 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👛 *Multi-Chain Wallet Support*
 💰 *Custom Trade Amount*
 📊 *Live Position Tracking*
+🎁 *New User Bonus: $25 FREE!*
+👥 *Refer & Earn: $0.50 per referral*
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ *WHY CHOOSE US?* ⚡
@@ -1025,6 +1364,8 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ *Multi-Chain Wallet Support*
 ✅ *Custom Trade Amount*
 ✅ *Real-time P&L Tracking*
+✅ *$25 New User Bonus*
+✅ *$0.50 per Referral*
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ *SUPPORTED WALLETS* ⚡
@@ -1036,7 +1377,7 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━━
 👇 *CLICK BUTTONS BELOW TO START* 👇
 
-💡 *Pro Tip:* Connect wallet for premium features!
+💡 *Pro Tip:* Connect wallet to claim $25 bonus!
 
 ⚠️ *Risk Warning:* Trade responsibly | Max 2% risk per trade
 📞 *Support:* @LawlietTobi
@@ -1070,14 +1411,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_custom_deposit(update, context)
         return
     
-    if context.user_data.get('awaiting_withdraw'):
-        await handle_withdraw(update, context)
+    if context.user_data.get('awaiting_deposit_network'):
+        await handle_deposit_network(update, context)
         return
     
+    if context.user_data.get('awaiting_withdraw_network'):
+        await handle_withdraw_network(update, context)
+        return
+    
+    if context.user_data.get('awaiting_withdraw_amount'):
+        await handle_withdraw_amount(update, context)
+        return
+    
+    # Wallet type selection
     if text in ["💎 TON", "🪙 TRC20 (USDT)", "🔷 BEP20 (USDT)", "💠 ERC20 (USDT)", "₿ BITCOIN", "◎ SOLANA"]:
         await handle_wallet_type(update, context)
         return
     
+    # Deposit amount selection
     if text in ["💰 $10", "💰 $25", "💰 $50", "💰 $100", "💰 $250", "💰 $500", "💰 $1000", "💰 CUSTOM"]:
         await handle_deposit_amount(update, context)
         return
@@ -1103,6 +1454,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deposit_menu(update, context)
     elif text == "💸 WITHDRAW":
         await withdraw_menu(update, context)
+    elif text == "🎁 CLAIM BONUS":
+        await claim_bonus_handler(update, context)
+    elif text == "👥 REFER & EARN":
+        await referral_handler(update, context)
     elif text == "📜 RECENT TRADES":
         await show_recent_trades(update, context)
     elif text == "❓ HELP & SUPPORT":
@@ -1114,11 +1469,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━━
 
 1️⃣ *Connect Wallet* → 👛 MY WALLET
-2️⃣ *Deposit Funds* → 💰 DEPOSIT
-3️⃣ *Get Signals* → 🪙 CRYPTO/FOREX/STOCKS
-4️⃣ *Click BUY* → Enter amount
-5️⃣ *Track Positions* → 📊 MY POSITIONS
-6️⃣ *Withdraw Profits* → 💸 WITHDRAW
+2️⃣ *Claim Bonus* → 🎁 CLAIM BONUS ($25 FREE!)
+3️⃣ *Deposit Funds* → 💰 DEPOSIT
+4️⃣ *Get Signals* → 🪙 CRYPTO/FOREX/STOCKS
+5️⃣ *Click BUY* → Enter amount
+6️⃣ *Track Positions* → 📊 MY POSITIONS
+7️⃣ *Withdraw Profits* → 💸 WITHDRAW
+8️⃣ *Refer Friends* → 👥 REFER & EARN ($0.50 each)
+
+━━━━━━━━━━━━━━━━━━━━━
+🎁 *NEW USER BONUS*
+━━━━━━━━━━━━━━━━━━━━━
+
+• Connect wallet and click CLAIM BONUS
+• Get $25 USDT FREE!
+• One time per user only
+
+━━━━━━━━━━━━━━━━━━━━━
+👥 *REFER & EARN*
+━━━━━━━━━━━━━━━━━━━━━
+
+• Share your unique referral link
+• Get $0.50 USDT for each friend who joins
+• Unlimited earnings!
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⚡ *CONFIDENCE LEVELS*
@@ -1159,6 +1532,8 @@ def main():
     print(f"👑 Admin ID: {ADMIN_CHAT_ID}")
     print(f"💾 Loaded {len(user_wallets)} wallets from storage")
     print(f"📊 Loaded {len(user_positions)} position records")
+    print(f"🎁 Bonus claimed: {len(bonus_claimed)} users")
+    print(f"👥 Referrals tracked: {len(referrals)} users")
     app.run_polling()
 
 if __name__ == "__main__":
