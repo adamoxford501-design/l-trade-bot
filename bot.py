@@ -26,8 +26,7 @@ NEW_USER_BONUS = 25
 REFERRAL_BONUS = 0.5
 MIN_WITHDRAWAL = 10
 
-PORT = int(os.environ.get('PORT', 10000))
-WEBHOOK_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
+PORT = int(os.environ.get('PORT', 8080))
 
 DEPOSIT_ADDRESSES = {
     "TRC20 (USDT)": "TLC8bebj9L57ZsihNiY32d4nWH8CVDvLpu",
@@ -125,7 +124,28 @@ user_trades = {}
 pending_deposits = {}
 pending_withdrawals = {}
 request_counter = 0
+bot_app = None
 
+# ---------- FLASK APP FOR WEBHOOK ----------
+flask_app = Flask(__name__)
+
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming Telegram updates"""
+    try:
+        update = Update.de_json(request.get_json(), bot_app.bot)
+        asyncio.run_coroutine_threadsafe(bot_app.process_update(update), asyncio.get_event_loop())
+        return 'ok', 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return 'error', 500
+
+@flask_app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "alive", "bot": "running"}), 200
+
+# ---------- HELPER FUNCTIONS ----------
 def save_wallet(user_id, address, wallet_type):
     if user_id not in user_wallets:
         user_wallets[user_id] = {'wallets': {}, 'balance': 0, 'deposits': [], 'withdrawals': [], 'connected_on': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -577,6 +597,7 @@ async def handle_deposit_amount(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_deposit_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('awaiting_deposit_network'):
         return
+    text = update.message.text
     wallet_type_map = {"💎 TON": "TON", "🪙 TRC20 (USDT)": "TRC20", "🔷 BEP20 (USDT)": "BEP20", "💠 ERC20 (USDT)": "ERC20", "₿ BITCOIN": "BITCOIN", "◎ SOLANA": "SOLANA"}
     if text in wallet_type_map:
         network = wallet_type_map[text]
@@ -947,13 +968,26 @@ async def main():
     await bot_app.initialize()
     await bot_app.start()
     
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    await bot_app.bot.set_webhook(webhook_url)
-    print(f"✅ Bot started! Webhook set to {webhook_url}")
+    # Get public URL from environment
+    public_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', os.environ.get('RENDER_EXTERNAL_URL', ''))
+    if public_url:
+        webhook_url = f"https://{public_url}/webhook" if not public_url.startswith('http') else f"{public_url}/webhook"
+        await bot_app.bot.set_webhook(webhook_url)
+        print(f"✅ Webhook set to {webhook_url}")
+    else:
+        print("⚠️ No public URL found, using polling mode")
     
-    threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=PORT), daemon=True).start()
+    # Start Flask in thread
+    def run_flask():
+        flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     
-    await asyncio.Event().wait()
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Keep alive
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
